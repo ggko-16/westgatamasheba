@@ -63,8 +63,8 @@ function confetti(){const wrap=document.createElement('div');wrap.className='con
 let selectedId=null;
 function showResult(data,id){
   stopCamera();busy=false;selectedId=id;const won=data.outcome==='win';
-  $('result-icon').textContent=won?'🎉':'🎁';$('result-title').textContent=won?'გილოცავთ! თქვენ მოიგეთ':'ამჯერად არ გაგიმართლათ!';
-  $('amount').hidden=!won;status('result-message',won?(data.paid?'ამ პოსტერის პრიზი უკვე გაცემულია.':'პოსტერის ღირებულება სრულად დაგიბრუნდებათ შეკვეთის გადამოწმების შემდეგ.'):'მადლობა, რომ აირჩიეთ WestFace.');
+  $('result-icon').textContent=won?'🎉':'🎁';$('result-title').textContent=won?'გილოცავთ! თქვენ მოიგეთ პოსტერის ღირებულება':'ამჯერად არ გაგიმართლათ!';
+  $('result-title').style.color=won?'var(--gold)':'';status('result-message',won?(data.paid?'ამ პოსტერის პრიზი უკვე გაცემულია.':'პოსტერის ღირებულება სრულად დაგიბრუნდებათ შეკვეთის გადამოწმების შემდეგ.'):'მადლობა, რომ აირჩიეთ WestFace.');
   $('claim-open').hidden=!won||data.paid;$('claim-form').hidden=true;$('claim-form').reset();status('claim-status','');$('modal').hidden=false;if(won&&!data.paid)confetti();
 }
 async function openGift(){

@@ -8,6 +8,7 @@ class MemoryStore {
   async getWithMetadata(key){return this.data.get(key)??null}
   async set(key,data,options={}){const old=this.data.get(key);if(options.onlyIfNew&&old||options.onlyIfMatch&&old?.etag!==options.onlyIfMatch)return {modified:false};const etag=String(++this.sequence);this.data.set(key,{data,etag});return {modified:true,etag}}
   async setJSON(key,data,options){return this.set(key,data,options)}
+  async delete(key){this.data.delete(key)}
   async *list({prefix}){yield {blobs:[...this.data.keys()].filter(k=>k.startsWith(prefix)).map(key=>({key}))}}
 }
 const origin='https://westface.example';
@@ -22,3 +23,38 @@ test('winning and losing outcomes remain fixed',async()=>{const {handler}=await 
 test('claim can only come from a winner; phone and consent required; repeated phone is idempotent',async()=>{const {handler,cookie}=await setup();const body={id:win,name:'ტესტი',phone:'555123456',consent:true};assert.equal((await handler(request('claim',{...body,id:lose}))).status,403);assert.equal((await handler(request('claim',{...body,consent:false}))).status,400);assert.deepEqual(await (await handler(request('claim',body))).json(),{ok:true,duplicate:false});assert.deepEqual(await (await handler(request('claim',body))).json(),{ok:true,duplicate:true});const admin=await (await handler(request('admin',undefined,cookie))).json();assert.equal(admin.claims.length,1);assert.equal(admin.claims[0].amount,45)});
 test('different phones can request review, but only one payout can be recorded',async()=>{const {handler,cookie}=await setup();for(const phone of ['555123456','555123457'])assert.equal((await handler(request('claim',{id:win,name:'ტესტი',phone,consent:true}))).status,200);const {claims}=await (await handler(request('admin',undefined,cookie))).json();const results=await Promise.all(claims.map(c=>handler(request('mark-paid',{claimId:c.id},cookie))));assert.deepEqual(results.map(x=>x.status).sort(),[200,409]);assert.equal((await (await handler(request('reveal',{id:win}))).json()).paid,true);assert.equal((await handler(request('claim',{id:win,name:'ტესტი',phone:'555123458',consent:true}))).status,409)});
 test('publishing preserves previous results and updates the index atomically',async()=>{const {handler,store,cookie}=await setup();const next='44444444-4444-4444-8444-444444444444',v2='55555555-5555-4555-8555-555555555555';await store.set(`images/${next}`,new ArrayBuffer(1));await store.set(`targets/${v2}/0`,new ArrayBuffer(1));const prior=await store.get('catalog'),payload={baseVersion:version,version:v2,chunks:1,items:[...prior.items,{id:next,name:'New',outcome:'win'}]};assert.equal((await handler(request('publish',{...payload,items:[{...prior.items[0],outcome:'lose'},...payload.items.slice(1)]},cookie))).status,409);assert.equal((await handler(request('publish',payload,cookie))).status,200);assert.deepEqual((await (await handler(request('catalog'))).json()).ids,[win,lose,next]);assert.equal((await handler(request('publish',payload,cookie))).status,409)});
+test('only an admin can remove a losing poster; winning records and claims survive',async()=>{
+  const {handler,store,cookie}=await setup(),v2='55555555-5555-4555-8555-555555555555';
+  await store.set(`images/${lose}`,new ArrayBuffer(1));await store.set(`targets/${version}/0`,new ArrayBuffer(1));
+  const payload={baseVersion:version,id:lose,version:v2,chunks:1};
+  await handler(request('claim',{id:win,name:'ტესტი',phone:'555123456',consent:true}));
+  assert.equal((await handler(request('remove-poster',payload))).status,401);
+  assert.equal((await handler(request('remove-poster',{...payload,id:win},cookie))).status,403);
+  assert.equal((await handler(request('remove-poster',payload,cookie))).status,400);
+  assert.deepEqual((await (await handler(request('catalog'))).json()).ids,[win,lose]);
+  await store.set(`targets/${v2}/0`,new ArrayBuffer(1));
+  assert.equal((await handler(request('remove-poster',payload,cookie))).status,200);
+  assert.deepEqual((await (await handler(request('catalog'))).json()).ids,[win]);
+  assert.equal(await store.get(`images/${lose}`),null);assert.equal(await store.get(`targets/${version}/0`),null);
+  assert.equal((await handler(request('reveal',{id:lose}))).status,404);
+  assert.equal((await handler(request('chunk',undefined,undefined,{version,part:0}))).status,409);
+  assert.equal((await (await handler(request('admin',undefined,cookie))).json()).claims.length,1);
+  assert.equal((await handler(request('remove-poster',payload,cookie))).status,409);
+});
+test('deleting the final losing poster leaves a valid empty catalog',async()=>{
+  const {handler,store,cookie}=await setup();await store.setJSON('catalog',{version,chunks:1,items:[{id:lose,name:'Other',outcome:'lose'}]});
+  assert.equal((await handler(request('remove-poster',{baseVersion:version,id:lose,version:null,chunks:0},cookie))).status,200);
+  assert.deepEqual(await (await handler(request('catalog'))).json(),{version:null,chunks:0,ids:[]});
+});
+test('custom poster price determines the claim and recorded payout; bad prices are rejected',async()=>{
+  const {handler,store,cookie}=await setup(),id='44444444-4444-4444-8444-444444444444',v2='55555555-5555-4555-8555-555555555555';
+  await store.set(`images/${id}`,new ArrayBuffer(1));await store.set(`targets/${v2}/0`,new ArrayBuffer(1));const prior=await store.get('catalog');
+  const payload={baseVersion:version,version:v2,chunks:1,items:[...prior.items,{id,name:'New',outcome:'win',price:67.5}]};
+  assert.equal((await handler(request('publish',{...payload,items:[...prior.items,{...payload.items.at(-1),price:-10}]},cookie))).status,400);
+  assert.equal((await handler(request('publish',payload,cookie))).status,200);
+  assert.equal((await (await handler(request('reveal',{id}))).json()).amount,67.5);
+  assert.equal((await handler(request('claim',{id,name:'ტესტი',phone:'555123456',consent:true,amount:9999}))).status,200);
+  const claim=(await (await handler(request('admin',undefined,cookie))).json()).claims[0];assert.equal(claim.amount,67.5);
+  assert.equal((await handler(request('mark-paid',{claimId:claim.id},cookie))).status,200);
+  assert.equal((await store.get(`paid/${id}`)).amount,67.5);
+});

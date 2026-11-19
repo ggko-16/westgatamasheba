@@ -13,6 +13,8 @@ const safeEq = (a,b) => { const x=Buffer.from(a??''),y=Buffer.from(b??''); retur
 const sign = (value,secret) => createHmac('sha256',secret).update(value).digest('base64url');
 const cookie = (value, maxAge) => `wf_admin=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 const hash = (str) => createHash('sha256').update(str).digest('hex');
+const validPrice = x => typeof x==='number' && Number.isFinite(x) && x>=.01 && x<=10000 && Math.abs(x*100-Math.round(x*100))<1e-6;
+const priceOf = x => validPrice(x?.price)?x.price:45;
 
 export function authorized(req, secret, now=Date.now()) {
   if (!secret || secret.length<32) return false;
@@ -36,6 +38,11 @@ const listPrefix = async (store,prefix) => {
   for await (const page of store.list({prefix,paginate:true})) result.push(...page.blobs);
   return result;
 };
+// The catalog is switched atomically before cleanup: a failed compile never loses a poster.
+async function cleanupOldTargets(store, catalog){
+  if(!catalog.version)return;
+  await Promise.allSettled(Array.from({length:catalog.chunks},(_,i)=>store.delete(`targets/${catalog.version}/${i}`)));
+}
 async function body(req,max=30000) {
   const raw=await req.text();
   if(raw.length>max) throw new Error('REQUEST_TOO_LARGE');
@@ -58,7 +65,7 @@ export function createHandler(storeFactory, env=process.env) {
       const secret=env.SESSION_SECRET??'', password=env.ADMIN_PASSWORD??'';
       const store=storeFactory();
       const auth=authorized(req,secret);
-      const adminActions=['admin','image','upload-image','upload-chunk','publish','mark-paid','logout'];
+      const adminActions=['admin','image','upload-image','upload-chunk','publish','remove-poster','mark-paid','logout'];
       if(adminActions.includes(action)&&!auth) return fail('გაიარეთ ავტორიზაცია',401);
       if(action==='login'&&write) {
         if(secret.length<32||password.length<12) return fail('სერვერის ადმინისტრირების პარამეტრები არ არის გამართული',503);
@@ -72,6 +79,8 @@ export function createHandler(storeFactory, env=process.env) {
       if(action==='chunk'&&method==='GET') {
         const version=url.searchParams.get('version'),part=url.searchParams.get('part');
         if(!idOk(version)||!indexOk(part))return fail('არასწორი ფაილი');
+        const catalog=await getJSON(store,'catalog')??initial();
+        if(version!==catalog.version||Number(part)>=catalog.chunks)return fail('AR მონაცემები განახლდა. გახსენით კამერა თავიდან.',409);
         return binary(await store.get(`targets/${version}/${Number(part)}`,{type:'arrayBuffer'}),'application/octet-stream');
       }
       if(action==='reveal'&&write) {
@@ -79,7 +88,7 @@ export function createHandler(storeFactory, env=process.env) {
         const poster=catalog.items.find(x=>x.id===b.id);
         if(!poster)return fail('პოსტერი ვერ მოიძებნა',404);
         const paid=poster.outcome==='win' && Boolean(await getJSON(store,`paid/${poster.id}`));
-        return json({outcome:poster.outcome,amount:poster.outcome==='win'?45:0,paid});
+        return json({outcome:poster.outcome,amount:poster.outcome==='win'?priceOf(poster):0,paid});
       }
       if(action==='claim'&&write) {
         const b=await body(req), catalog=await getJSON(store,'catalog')??initial();
@@ -89,7 +98,7 @@ export function createHandler(storeFactory, env=process.env) {
         const phone=normalizePhone(b.phone);
         if(!textOk(b.name,80)||!phone||b.consent!==true)return fail('შეავსეთ სახელი, ნომერი და თანხმობა');
         const key=`claims/${poster.id}/${hash(phone).slice(0,32)}`;
-        const claim={id:key,posterId:poster.id,posterName:poster.name,name:b.name.trim(),phone,amount:45,createdAt:new Date().toISOString()};
+        const claim={id:key,posterId:poster.id,posterName:poster.name,name:b.name.trim(),phone,amount:priceOf(poster),createdAt:new Date().toISOString()};
         const saved=await store.setJSON(key,claim,{onlyIfNew:true});
         return json({ok:true,duplicate:!saved.modified});
       }
@@ -120,21 +129,41 @@ export function createHandler(storeFactory, env=process.env) {
       if(action==='publish'&&write) {
         const b=await body(req,80000), current=await store.getWithMetadata('catalog',{type:'json'}), old=current?.data??initial();
         if(b.baseVersion!==old.version)return fail('მონაცემები განახლდა. გადატვირთეთ გვერდი',409);
-        if(!idOk(b.version)||!Number.isInteger(b.chunks)||b.chunks<1||b.chunks>60||!Array.isArray(b.items)||b.items.length!==old.items.length+1||b.items.length>40)return fail('არასწორი კატალოგი ან ლიმიტი');
+        if(!idOk(b.version)||b.version===old.version||!Number.isInteger(b.chunks)||b.chunks<1||b.chunks>60||!Array.isArray(b.items)||b.items.length!==old.items.length+1||b.items.length>40)return fail('არასწორი კატალოგი ან ლიმიტი');
         if(old.items.some((x,i)=>JSON.stringify(x)!==JSON.stringify(b.items[i])))return fail('უკვე გამოქვეყნებული შედეგი არ იცვლება',409);
         const newPoster=b.items.at(-1);
-        if(!idOk(newPoster?.id)||!textOk(newPoster.name,100)||!['win','lose'].includes(newPoster.outcome)||old.items.some(x=>x.id===newPoster.id))return fail('არასწორი პოსტერი');
+        if(!idOk(newPoster?.id)||!textOk(newPoster.name,100)||!['win','lose'].includes(newPoster.outcome)||old.items.some(x=>x.id===newPoster.id)|| (newPoster.price!==undefined&&!validPrice(newPoster.price)))return fail('არასწორი პოსტერი ან ღირებულება');
         if(!await store.get(`images/${newPoster.id}`,{type:'arrayBuffer'}))return fail('ფოტო არ მოიძებნა');
         for(let i=0;i<b.chunks;i++)if(!await store.get(`targets/${b.version}/${i}`,{type:'arrayBuffer'}))return fail('AR ფაილი არასრულია');
-        const catalog={version:b.version,chunks:b.chunks,items:[...old.items,{id:newPoster.id,name:newPoster.name.trim(),outcome:newPoster.outcome}]};
+        const catalog={version:b.version,chunks:b.chunks,items:[...old.items,{id:newPoster.id,name:newPoster.name.trim(),outcome:newPoster.outcome,price:priceOf(newPoster)}]};
         const result=await store.setJSON('catalog',catalog,current?{onlyIfMatch:current.etag}:{onlyIfNew:true});
-        return result.modified?json({ok:true}):fail('მონაცემები შეიცვალა; სცადეთ თავიდან',409);
+        if(!result.modified)return fail('მონაცემები შეიცვალა; სცადეთ თავიდან',409);
+        await cleanupOldTargets(store,old);
+        return json({ok:true});
+      }
+      if(action==='remove-poster'&&write) {
+        const b=await body(req),current=await store.getWithMetadata('catalog',{type:'json'}),old=current?.data??initial();
+        if(!current||b.baseVersion!==old.version)return fail('მონაცემები განახლდა. გადატვირთეთ გვერდი',409);
+        const poster=old.items.find(x=>x.id===b.id);
+        if(!poster)return fail('პოსტერი ვერ მოიძებნა',404);
+        if(poster.outcome!=='lose')return fail('გამარჯვებული პოსტერის წაშლა შეუძლებელია',403);
+        const items=old.items.filter(x=>x.id!==b.id);
+        if(items.length===0){
+          if(b.version!==null||b.chunks!==0)return fail('არასწორი ცარიელი AR კატალოგი');
+        }else{
+          if(!idOk(b.version)||b.version===old.version||!Number.isInteger(b.chunks)||b.chunks<1||b.chunks>60)return fail('არასწორი AR კატალოგი');
+          for(let i=0;i<b.chunks;i++)if(!await store.get(`targets/${b.version}/${i}`,{type:'arrayBuffer'}))return fail('AR ფაილი არასრულია');
+        }
+        const result=await store.setJSON('catalog',{version:b.version,chunks:b.chunks,items},{onlyIfMatch:current.etag});
+        if(!result.modified)return fail('მონაცემები შეიცვალა; სცადეთ თავიდან',409);
+        await Promise.allSettled([store.delete(`images/${poster.id}`),cleanupOldTargets(store,old)]);
+        return json({ok:true});
       }
       if(action==='mark-paid'&&write) {
         const b=await body(req);
         if(typeof b.claimId!=='string'||!/^claims\/[a-f0-9-]{36}\/[a-f0-9]{32}$/.test(b.claimId))return fail('არასწორი განაცხადი');
         const claim=await getJSON(store,b.claimId); if(!claim)return fail('განაცხადი ვერ მოიძებნა',404);
-        const result=await store.setJSON(`paid/${claim.posterId}`,{claimId:claim.id,paidAt:new Date().toISOString(),amount:45},{onlyIfNew:true});
+        const result=await store.setJSON(`paid/${claim.posterId}`,{claimId:claim.id,paidAt:new Date().toISOString(),amount:priceOf({price:claim.amount})},{onlyIfNew:true});
         return result.modified?json({ok:true}):fail('ამ პოსტერის პრიზი უკვე დაფიქსირებულია',409);
       }
       return fail('გვერდი ვერ მოიძებნა',404);
